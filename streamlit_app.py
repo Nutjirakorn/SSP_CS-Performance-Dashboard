@@ -2,8 +2,14 @@
 SSP_CS Performance Dashboard (Streamlit)
 
 Reads the Google Sheet "OFM(CS)_SSP Performance Tracking" directly, so the dashboard
-follows the sheet: the data is re-downloaded every REFRESH_SECONDS (and on the
-Refresh button) and the page re-renders itself on that schedule.
+follows the sheet automatically:
+  * every CHECK_SECONDS a small background poll fetches a CSV fingerprint of the two
+    tabs; when it differs from the last one the workbook is re-downloaded, re-parsed
+    and the whole page re-renders (so an edit in the sheet shows up within about a
+    minute, with no manual reload);
+  * REFRESH_SECONDS is a safety net: the workbook is re-downloaded at least that
+    often even if the fingerprint poll fails;
+  * the "Refresh now" button forces a reload.
 
 Sheet tabs used
   CS_By Date          daily tracker: Call, Chat (Line), Chat (Facebook), Email,
@@ -18,9 +24,11 @@ private sheet, see load_workbook_bytes() for the service-account option.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import io
 import os
 import re
+import time
 from collections import OrderedDict
 
 import pandas as pd
@@ -33,7 +41,10 @@ import openpyxl
 SHEET_ID = "1-25DimfROhlDz379xZUVQ4SCitavqRolfm5Xwh2y_J0"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
-REFRESH_SECONDS = 300          # how often the page re-downloads the sheet (5 minutes)
+CHECK_SECONDS = 60             # how often the page checks the sheet for changes
+REFRESH_SECONDS = 900          # safety net: full re-download at least this often (15 minutes)
+TABS = ["CS_By Date", "SSP_Campaign Plan"]
+CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={{sheet}}"
 LOCAL_XLSX = os.environ.get("SSP_LOCAL_XLSX")  # optional: path to an offline copy for testing
 
 CHANNELS = OrderedDict([
@@ -60,10 +71,28 @@ STD = {
 }
 
 # ----------------------------------------------------------------------------- loading
+@st.cache_data(ttl=CHECK_SECONDS, show_spinner=False)
+def sheet_fingerprint() -> str:
+    """A cheap hash of the two tabs (CSV export). Cached CHECK_SECONDS, so at most one
+    small download per minute for all readers. Changes whenever a cell changes."""
+    if LOCAL_XLSX:
+        return str(os.path.getmtime(LOCAL_XLSX))
+    h = hashlib.sha1()
+    try:
+        for tab in TABS:
+            r = requests.get(CSV_URL.format(sheet=requests.utils.quote(tab)), timeout=30)
+            r.raise_for_status()
+            h.update(r.content)
+        return h.hexdigest()
+    except Exception:
+        # poll failed: fall back to a time bucket so the data still refreshes every REFRESH_SECONDS
+        return f"t{int(time.time() // REFRESH_SECONDS)}"
+
+
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner="Loading the Google Sheet…")
-def load_workbook_bytes() -> tuple[bytes, dt.datetime]:
-    """Download the sheet as xlsx. Cached for REFRESH_SECONDS, so every reader within
-    that window shares one download and the data is never older than that."""
+def load_workbook_bytes(fingerprint: str) -> tuple[bytes, dt.datetime]:
+    """Download the sheet as xlsx. Keyed by the fingerprint, so a new download happens
+    only when the sheet changed (or REFRESH_SECONDS passed)."""
     if LOCAL_XLSX:
         with open(LOCAL_XLSX, "rb") as f:
             return f.read(), dt.datetime.now()
@@ -226,8 +255,8 @@ def parse_campaigns(wb) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=REFRESH_SECONDS)
-def load_data():
-    content, fetched_at = load_workbook_bytes()
+def load_data(fingerprint: str):
+    content, fetched_at = load_workbook_bytes(fingerprint)
     wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
     return parse_daily(wb), parse_campaigns(wb), fetched_at
 
@@ -269,7 +298,8 @@ def seg_metrics(df: pd.DataFrame, seg: str) -> dict:
     complete, pending = s("complete"), s("pending")
     hc = s("hc")
     return dict(
-        answered=answered, abandoned=abandoned, abandon_rate=rate(abandoned, answered),
+        answered=answered, abandoned=abandoned, total_contacts=(answered or 0) + (abandoned or 0),
+        abandon_rate=rate(abandoned, answered), answer_rate=rate(answered, abandoned),
         short_abandoned=s("short_abandoned"), out_of_service=s("out_of_service"),
         wait=m("avg_wait_sec"), csat=m("csat"), complete=complete, pending=pending,
         total_cases=(complete or 0) + (pending or 0), complete_rate=rate(complete, pending),
@@ -282,10 +312,12 @@ def totals(df: pd.DataFrame) -> dict:
     answered = sum((seg[c]["answered"] or 0) for c in CONTACT)
     abandoned = sum((seg[c]["abandoned"] or 0) for c in CONTACT)
     days = int(df["date"].nunique())
-    return dict(seg=seg, answered=answered, abandoned=abandoned, abandon_rate=rate(abandoned, answered),
-                answer_rate=(1 - rate(abandoned, answered)) if rate(abandoned, answered) is not None else None,
+    total = answered + abandoned
+    return dict(seg=seg, answered=answered, abandoned=abandoned, total_contacts=total, abandon_rate=rate(abandoned, answered),
+                answer_rate=rate(answered, abandoned),
                 wait=seg["call"]["wait"], csat_call=seg["call"]["csat"], csat_chat=seg["line"]["csat"],
-                case=seg["case"], complaint=seg["complaint"], days=days, per_day=(answered / days) if days else None)
+                case=seg["case"], complaint=seg["complaint"], days=days, per_day=(total / days) if days else None,
+                answered_per_day=(answered / days) if days else None)
 
 
 def gran_for(start, end):
@@ -319,7 +351,7 @@ def add_campaign_bands(fig, camps, start, end):
 def base_layout(fig, h=320, ytitle=None, yfmt=None):
     fig.update_layout(height=h, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=-0.2),
                       hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-    fig.update_yaxes(title=ytitle, tickformat=yfmt, gridcolor="rgba(128,128,128,0.2)")
+    fig.update_layout(yaxis=dict(title=ytitle, tickformat=yfmt, gridcolor="rgba(128,128,128,0.2)"))
     fig.update_xaxes(showgrid=False)
     return fig
 
@@ -370,11 +402,23 @@ def suggestions(key, seg, m, off=None):
 st.set_page_config(page_title="SSP_CS Performance Dashboard", layout="wide", page_icon="📞")
 
 
-@st.fragment(run_every=dt.timedelta(seconds=REFRESH_SECONDS))
+@st.fragment(run_every=dt.timedelta(seconds=CHECK_SECONDS))
+def watch_sheet():
+    """Runs every CHECK_SECONDS in the background. When the sheet's fingerprint changes
+    it reruns the whole app, which reloads the data and redraws every chart."""
+    fp = sheet_fingerprint()
+    if st.session_state.get("fp") not in (None, fp):
+        st.session_state["fp"] = fp
+        st.session_state["changed_at"] = dt.datetime.now()
+        st.rerun(scope="app")
+    st.session_state["fp"] = fp
+    st.caption(f"Watching the sheet for changes · last check {dt.datetime.now():%H:%M:%S} · every {CHECK_SECONDS}s")
+
+
 def dashboard():
-    # ---- load (cached, auto-expires) ----
+    # ---- load (cached; re-downloaded when the sheet changes) ----
     try:
-        daily, camps, fetched_at = load_data()
+        daily, camps, fetched_at = load_data(sheet_fingerprint())
         st.session_state["last_good"] = (daily, camps, fetched_at)
         load_error = None
     except Exception as ex:  # keep showing the last good data if the sheet is unreachable
@@ -389,8 +433,12 @@ def dashboard():
     # ---- header ----
     st.title("SSP_CS Performance Dashboard")
     c1, c2 = st.columns([4, 1])
+    changed = st.session_state.get("changed_at")
     c1.caption(f"Source: [OFM(CS)_SSP Performance Tracking]({SHEET_URL}) · data {data_min:%-d %b %Y} to {data_max:%-d %b %Y} · "
-               f"loaded {fetched_at:%-d %b %Y %H:%M} · re-checks the sheet every {REFRESH_SECONDS // 60} min")
+               f"loaded {fetched_at:%-d %b %Y %H:%M}" + (f" · sheet change picked up {changed:%H:%M}" if changed else "")
+               + " · updates automatically when the sheet changes")
+    with c1:
+        watch_sheet()
     if c2.button("🔄 Refresh now", width="stretch"):
         st.cache_data.clear()
         st.rerun()
@@ -493,8 +541,9 @@ def dashboard():
         if sec: return f"{d:+.0f}s"
         return f"{(d / prev_v * 100):+.0f}%" if prev_v else f"{d:+,.0f}"
     kpis = [
-        ("Contacts handled", fmt("int", T["answered"]), delta(T["answered"], P["answered"]), "normal", None, "Calls, chats and emails answered"),
-        ("Abandon rate (all)", fmt("pct2", T["abandon_rate"]), delta(T["abandon_rate"], P["abandon_rate"], pct=True), "inverse", None, None),
+        ("Total contacts", fmt("int", T["total_contacts"]), delta(T["total_contacts"], P["total_contacts"]), "normal", None, "Answered + abandoned across call, chat and email"),
+        ("Answered", fmt("int", T["answered"]), delta(T["answered"], P["answered"]), "normal", None, "Contacts our CS responded to"),
+        ("% responded", fmt("pct", T["answer_rate"]), delta(T["answer_rate"], P["answer_rate"], pct=True), "normal", grade("abandon_all", T["abandon_rate"]), f"Abandoned {fmt('int', T['abandoned'])} ({fmt('pct2', T['abandon_rate'])})"),
         ("Call abandon rate", fmt("pct2", T["seg"]["call"]["abandon_rate"]), delta(T["seg"]["call"]["abandon_rate"], P["seg"]["call"]["abandon_rate"], pct=True), "inverse", g_call, None),
         ("Avg call wait", fmt("sec", T["wait"]), delta(T["wait"], P["wait"], sec=True), "inverse", g_wait, None),
         ("CSAT (call)", fmt("pct", T["csat_call"]), delta(T["csat_call"], P["csat_call"], pct=True), "normal", g_csat, f"Chat CSAT {fmt('pct', T['csat_chat'])}"),
@@ -526,19 +575,28 @@ def dashboard():
     # ---- by segment ----
     st.subheader("By segment")
     seg_cols = st.columns(7)
+    S = T["seg"]
+    SUB = {"total": "total contacts (answered + abandoned)", "call": "total calls", "line": "total chats", "facebook": "total chats",
+           "email": "total emails", "case": "total cases (complete + pending)", "complaint": "total complaints (resolved + pending)"}
+    ANS = {"total": (T["answered"], T["total_contacts"], "answered"), "call": (S["call"]["answered"], S["call"]["total_contacts"], "answered"),
+           "line": (S["line"]["answered"], S["line"]["total_contacts"], "answered"), "facebook": (S["facebook"]["answered"], S["facebook"]["total_contacts"], "answered"),
+           "email": (S["email"]["answered"], S["email"]["total_contacts"], "answered"), "case": (T["case"]["complete"], T["case"]["total_cases"], "complete"),
+           "complaint": (T["complaint"]["complete"], T["complaint"]["total_cases"], "resolved")}
     cards = [
-        ("total", "Total contacts", T["answered"], [("Abandon rate", fmt("pct2", T["abandon_rate"]), None), ("Cases", fmt("int", T["case"]["total_cases"]), None), ("Complaints", fmt("int", T["complaint"]["total_cases"]), None)]),
-        ("call", "Call", T["seg"]["call"]["answered"], [("Abandon rate", fmt("pct2", T["seg"]["call"]["abandon_rate"]), g_call), ("Avg wait", fmt("sec", T["seg"]["call"]["wait"]), g_wait), ("CSAT", fmt("pct", T["seg"]["call"]["csat"]), g_csat), ("Per agent-day", fmt("int", T["seg"]["call"]["per_agent_day"]), None)]),
-        ("line", "Chat (Line)", T["seg"]["line"]["answered"], [("Abandon rate", fmt("pct2", T["seg"]["line"]["abandon_rate"]), g_line), ("Out of hours", fmt("int", T["seg"]["line"]["out_of_service"]), None), ("CSAT", fmt("pct", T["seg"]["line"]["csat"]), g_csat_line)]),
-        ("facebook", "Chat (Facebook)", T["seg"]["facebook"]["answered"], [("Abandon rate", fmt("pct2", T["seg"]["facebook"]["abandon_rate"]), g_fb), ("Out of hours", fmt("int", T["seg"]["facebook"]["out_of_service"]), None), ("CSAT", fmt("pct", T["seg"]["facebook"]["csat"]), g_csat_fb)]),
-        ("email", "Email", T["seg"]["email"]["answered"], [("Unanswered", fmt("int", T["seg"]["email"]["abandoned"]), None), ("Unanswered rate", fmt("pct2", T["seg"]["email"]["abandon_rate"]), g_email)]),
+        ("total", "All channels", T["total_contacts"], [("Abandoned", fmt("int", T["abandoned"]), None), ("Abandon rate", fmt("pct2", T["abandon_rate"]), None), ("Cases", fmt("int", T["case"]["total_cases"]), None), ("Complaints", fmt("int", T["complaint"]["total_cases"]), None)]),
+        ("call", "Call", T["seg"]["call"]["total_contacts"], [("Abandon rate", fmt("pct2", T["seg"]["call"]["abandon_rate"]), g_call), ("Avg wait", fmt("sec", T["seg"]["call"]["wait"]), g_wait), ("CSAT", fmt("pct", T["seg"]["call"]["csat"]), g_csat), ("Per agent-day", fmt("int", T["seg"]["call"]["per_agent_day"]), None)]),
+        ("line", "Chat (Line)", T["seg"]["line"]["total_contacts"], [("Abandon rate", fmt("pct2", T["seg"]["line"]["abandon_rate"]), g_line), ("Out of hours", fmt("int", T["seg"]["line"]["out_of_service"]), None), ("CSAT", fmt("pct", T["seg"]["line"]["csat"]), g_csat_line)]),
+        ("facebook", "Chat (Facebook)", T["seg"]["facebook"]["total_contacts"], [("Abandon rate", fmt("pct2", T["seg"]["facebook"]["abandon_rate"]), g_fb), ("Out of hours", fmt("int", T["seg"]["facebook"]["out_of_service"]), None), ("CSAT", fmt("pct", T["seg"]["facebook"]["csat"]), g_csat_fb)]),
+        ("email", "Email", T["seg"]["email"]["total_contacts"], [("Unanswered", fmt("int", T["seg"]["email"]["abandoned"]), None), ("Unanswered rate", fmt("pct2", T["seg"]["email"]["abandon_rate"]), g_email)]),
         ("case", "Case management", T["case"]["total_cases"], [("Complete", fmt("int", T["case"]["complete"]), None), ("Pending", fmt("int", T["case"]["pending"]), None), ("Completion", fmt("pct", T["case"]["complete_rate"]), g_case)]),
         ("complaint", "Complaint", T["complaint"]["total_cases"], [("Resolved", fmt("int", T["complaint"]["complete"]), None), ("Pending", fmt("int", T["complaint"]["pending"]), None), ("Resolution", fmt("pct", T["complaint"]["complete_rate"]), g_compl)]),
     ]
     for col, (sid, title, big, rows) in zip(seg_cols, cards):
         with col:
             st.markdown(f"**{title}**")
-            st.markdown(f"<span style='font-size:1.8rem'>{fmt('int', big)}</span>", unsafe_allow_html=True)
+            st.markdown(f"<span style='font-size:1.8rem'>{fmt('int', big)}</span><br><span style='opacity:.7'>{SUB[sid]}</span>", unsafe_allow_html=True)
+            a, tot, word = ANS[sid]
+            st.markdown(f"**{fmt('int', a)} {word}** · {fmt('pct', (a or 0) / tot) if tot else '—'} responded")
             for lab, val, g in rows:
                 st.caption(f"{lab}: **{val}** {BADGE[g].split(' ')[0] if g else ''}")
 
@@ -551,15 +609,17 @@ def dashboard():
     for c in CONTACT:
         if c in vol.columns:
             fig.add_bar(x=vol.index, y=vol[c], name=SEG_NAME[c], marker_color=COLOR[c])
-    fig.update_layout(barmode="stack", title="Contacts handled by channel")
+    fig.update_layout(barmode="stack", title="Contacts answered by channel")
+    ab = cur[cur["channel"].isin(CONTACT)].groupby("bucket")["abandoned"].sum()
+    fig.add_bar(x=ab.index, y=ab.values, name="Abandoned (all channels)", marker_color="#E45756")
     add_campaign_bands(fig, camps, s_ts, e_ts)
     st.plotly_chart(base_layout(fig, 340, "contacts"), width="stretch")
 
     v1, v2 = st.columns(2)
-    share = pd.Series({SEG_NAME[c]: (T["seg"][c]["answered"] or 0) for c in CONTACT}).sort_values()
+    share = pd.Series({SEG_NAME[c]: (T["seg"][c]["total_contacts"] or 0) for c in CONTACT}).sort_values()
     f2 = go.Figure(go.Bar(x=share.values, y=share.index, orientation="h", marker_color=[COLOR[k] for k in [c for c in CONTACT for n in [SEG_NAME[c]] if n in share.index]][: len(share)],
-                          text=[f"{v:,.0f} · {v / max(T['answered'], 1):.1%}" for v in share.values], textposition="outside"))
-    f2.update_layout(title="Share of contacts by channel")
+                          text=[f"{v:,.0f} · {v / max(T['total_contacts'], 1):.1%}" for v in share.values], textposition="outside"))
+    f2.update_layout(title="Share of total contacts by channel")
     v1.plotly_chart(base_layout(f2, 280), width="stretch")
     cs = cur[cur["channel"] == "case"].groupby("bucket")[["complete", "pending"]].sum()
     f3 = go.Figure([go.Bar(x=cs.index, y=cs["complete"], name="Complete", marker_color=COLOR["case"]), go.Bar(x=cs.index, y=cs["pending"], name="Pending", marker_color=COLOR["complaint"])])
@@ -589,7 +649,7 @@ def dashboard():
         c1, c2 = st.columns(2)
         f4 = go.Figure(go.Bar(x=tbl["per_day"], y=tbl["label"], orientation="h", marker_color=[{"Mega Sale": "#E45756", "Brand Day": "#4C78A8", "Seasonal": "#54A24B"}.get(k, "#999") for k in tbl["kind"]],
                               text=[f"{v:.0f} · {d} d" for v, d in zip(tbl["per_day"], tbl["days"])], textposition="outside"))
-        f4.update_layout(title="Contacts handled per day, by campaign")
+        f4.update_layout(title="Total contacts per day, by campaign")
         c1.plotly_chart(base_layout(f4, max(240, 32 * len(tbl))), width="stretch")
         f5 = go.Figure(go.Bar(x=tbl["answer_rate"], y=tbl["label"], orientation="h", marker_color=[{"Mega Sale": "#E45756", "Brand Day": "#4C78A8", "Seasonal": "#54A24B"}.get(k, "#999") for k in tbl["kind"]],
                               text=[f"{v:.1%} · {a:,.0f} lost" for v, a in zip(tbl["answer_rate"].fillna(0), tbl["abandoned"])], textposition="outside"))
@@ -600,12 +660,12 @@ def dashboard():
         show = pd.DataFrame({
             "Campaign": tbl["label"], "Type": tbl["kind"],
             "Window": [("selected period" if k == "—" else f"{s:%-d %b} to {e:%-d %b %Y}") for k, s, e in zip(tbl["kind"], tbl["start"], tbl["end"])],
-            "Days": tbl["days"], "Contacts": tbl["answered"], "Per day": tbl["per_day"].round(0),
+            "Days": tbl["days"], "Total contacts": tbl["total_contacts"], "Answered": tbl["answered"], "Per day": tbl["per_day"].round(0),
             "Abandon %": tbl["abandon_rate"], "Response %": tbl["answer_rate"], "Avg call wait (s)": tbl["wait"].round(0),
             "Call CSAT": tbl["csat_call"], "Cases": [c["total_cases"] for c in tbl["case"]], "Complaints": [c["total_cases"] for c in tbl["complaint"]],
             "Complaints per 1,000": [(c["total_cases"] / a * 1000) if a else None for c, a in zip(tbl["complaint"], tbl["answered"])],
         })
-        st.dataframe(show.style.format({"Abandon %": "{:.2%}", "Response %": "{:.1%}", "Call CSAT": "{:.1%}", "Contacts": "{:,.0f}", "Per day": "{:,.0f}", "Complaints per 1,000": "{:.2f}"}, na_rep="—"),
+        st.dataframe(show.style.format({"Abandon %": "{:.2%}", "Response %": "{:.1%}", "Call CSAT": "{:.1%}", "Total contacts": "{:,.0f}", "Answered": "{:,.0f}", "Per day": "{:,.0f}", "Complaints per 1,000": "{:.2f}"}, na_rep="—"),
                      width="stretch", hide_index=True)
         if tbl["clipped"].any():
             st.caption("* window extends beyond the selected period; figures cover the days inside it.")
@@ -637,23 +697,29 @@ def dashboard():
     st.subheader(f"Segment detail: {SEG_NAME[seg]}")
     if seg == "total":
         d = cur[cur["channel"].isin(CONTACT)].pivot_table(index="date", columns="channel", values="answered", aggfunc="sum").fillna(0)
-        d["Handled"] = d.sum(axis=1)
+        d["Answered"] = d.sum(axis=1)
         d["Abandoned"] = cur[cur["channel"].isin(CONTACT)].groupby("date")["abandoned"].sum()
-        d["Abandon %"] = d["Abandoned"] / (d["Handled"] + d["Abandoned"])
+        d.insert(0, "Total contacts", d["Answered"] + d["Abandoned"])
+        d["% responded"] = d["Answered"] / d["Total contacts"]
+        d["Abandon %"] = d["Abandoned"] / d["Total contacts"]
         d["Cases"] = cur[cur["channel"] == "case"].groupby("date")[["complete", "pending"]].sum().sum(axis=1)
         d["Complaints"] = cur[cur["channel"] == "complaint"].groupby("date")[["complete", "pending"]].sum().sum(axis=1)
         d.insert(0, "Campaign", [campaign_at(camps, x) for x in d.index])
         d = d.rename(columns=SEG_NAME)
-        st.dataframe(d.style.format({"Abandon %": "{:.2%}"}, precision=0, na_rep="—"), width="stretch")
+        k = st.columns(5)
+        k[0].metric("Total contacts", fmt("int", T["total_contacts"])); k[1].metric("Answered", fmt("int", T["answered"]))
+        k[2].metric(f"% responded · {BADGE[grade('abandon_all', T['abandon_rate'])]}", fmt("pct", T["answer_rate"]))
+        k[3].metric("Abandoned", fmt("int", T["abandoned"])); k[4].metric("Prior period total contacts", fmt("int", P["total_contacts"]))
+        st.dataframe(d.style.format({"Abandon %": "{:.2%}", "% responded": "{:.1%}"}, precision=0, na_rep="—"), width="stretch")
     else:
         r = cur[cur["channel"] == seg].set_index("date").sort_index()
         m = T["seg"][seg]
-        c = st.columns(5)
+        c = st.columns(6)
         if seg in ("case", "complaint"):
             key = "case_complete" if seg == "case" else "complaint_resolved"
             c[0].metric("Logged", fmt("int", m["total_cases"])); c[1].metric("Complete" if seg == "case" else "Resolved", fmt("int", m["complete"]))
             c[2].metric("Pending", fmt("int", m["pending"])); c[3].metric(f"Rate · {BADGE[grade(key, m['complete_rate'])]}", fmt("pct", m["complete_rate"]))
-            c[4].metric("Per day", fmt("int", m["total_cases"] / max(1, m["days"])))
+            c[4].metric("Per day", fmt("int", m["total_cases"] / max(1, m["days"]))); c[5].metric("Prior period logged", fmt("int", P["seg"][seg]["total_cases"]))
             fig = go.Figure([go.Bar(x=r.index, y=r["complete"], name="Complete", marker_color=COLOR[seg]), go.Bar(x=r.index, y=r["pending"], name="Pending", marker_color="#E45756")])
             fig.update_layout(barmode="stack")
             cols = ["complete", "pending"]
@@ -661,23 +727,26 @@ def dashboard():
             cols.append("rate")
         else:
             akey = {"call": "abandon_call", "email": "abandon_email"}.get(seg, "abandon_chat")
-            c[0].metric("Answered", fmt("int", m["answered"])); c[1].metric("Abandoned" if seg != "email" else "Unanswered", fmt("int", m["abandoned"]))
-            c[2].metric(f"Abandon rate · {BADGE[grade(akey, m['abandon_rate'])]}", fmt("pct2", m["abandon_rate"]))
+            c[0].metric("Total contacts", fmt("int", m["total_contacts"])); c[1].metric("Answered", fmt("int", m["answered"]))
+            c[2].metric(f"% responded · {BADGE[grade(akey, m['abandon_rate'])]}", fmt("pct", m["answer_rate"]))
+            c[3].metric("Abandoned" if seg != "email" else "Unanswered", fmt("int", m["abandoned"]), help=f"Abandon rate {fmt('pct2', m['abandon_rate'])}")
             if seg == "call":
-                c[3].metric(f"Avg wait · {BADGE[grade('wait', m['wait'])]}", fmt("sec", m["wait"]))
+                c[4].metric(f"Avg wait · {BADGE[grade('wait', m['wait'])]}", fmt("sec", m["wait"]))
             else:
-                c[3].metric("Out of service hours" if seg != "email" else "Avg HC", fmt("int", m["out_of_service"] if seg != "email" else (m["hc_days"] / max(1, m["days"]) if m["hc_days"] else None)))
-            c[4].metric(f"CSAT · {BADGE[grade('csat', m['csat'])]}" if seg != "email" else "Per agent-day", fmt("pct", m["csat"]) if seg != "email" else fmt("int", m["per_agent_day"]))
+                c[4].metric("Out of service hours" if seg != "email" else "Avg HC", fmt("int", m["out_of_service"] if seg != "email" else (m["hc_days"] / max(1, m["days"]) if m["hc_days"] else None)))
+            c[5].metric(f"CSAT · {BADGE[grade('csat', m['csat'])]}" if seg != "email" else "Per agent-day", fmt("pct", m["csat"]) if seg != "email" else fmt("int", m["per_agent_day"]))
             fig = go.Figure([go.Bar(x=r.index, y=r["answered"], name="Answered", marker_color=COLOR[seg]), go.Bar(x=r.index, y=r["abandoned"], name="Abandoned", marker_color="#E45756")])
             fig.update_layout(barmode="stack")
             cols = [x for x in ["answered", "abandoned", "short_abandoned", "avg_wait_sec", "out_of_service", "csat", "hc"] if x in r.columns and r[x].notna().any()]
-            r["abandon %"] = r["abandoned"] / (r["answered"] + r["abandoned"])
-            cols.insert(2, "abandon %")
+            r["total"] = r["answered"].fillna(0) + r["abandoned"].fillna(0)
+            r["% responded"] = r["answered"] / r["total"]
+            r["abandon %"] = r["abandoned"] / r["total"]
+            cols = ["total", "% responded"] + cols[:2] + ["abandon %"] + cols[2:]
         add_campaign_bands(fig, camps, s_ts, e_ts)
         st.plotly_chart(base_layout(fig, 280), width="stretch")
         tbl = r[cols].copy()
         tbl.insert(0, "campaign", [campaign_at(camps, x) for x in tbl.index])
-        st.dataframe(tbl.style.format({"abandon %": "{:.2%}", "csat": "{:.1%}", "rate": "{:.1%}", "avg_wait_sec": "{:.0f}"}, precision=0, na_rep="—"), width="stretch")
+        st.dataframe(tbl.style.format({"abandon %": "{:.2%}", "% responded": "{:.1%}", "csat": "{:.1%}", "rate": "{:.1%}", "avg_wait_sec": "{:.0f}"}, precision=0, na_rep="—"), width="stretch")
 
 
 dashboard()
