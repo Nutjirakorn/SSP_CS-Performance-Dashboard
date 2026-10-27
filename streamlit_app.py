@@ -11,6 +11,10 @@ follows the sheet automatically:
     often even if the fingerprint poll fails;
   * the "Refresh now" button forces a reload.
 
+Filters: From/To only (presets or custom dates). Campaign periods are not a filter;
+they appear as shaded windows on the charts, in the daily tables and in the
+"Campaign periods" section, always following the selected From/To dates.
+
 Sheet tabs used
   CS_By Date          daily tracker: Call, Chat (Line), Chat (Facebook), Email,
                       Case Management, Complaint
@@ -348,6 +352,22 @@ def add_campaign_bands(fig, camps, start, end):
                       annotation_text=c["campaign"], annotation_position="top left", annotation_font_size=10, layer="below")
 
 
+def add_resp_line(fig, df, channels):
+    """% responded (answered ÷ total) per bucket on a right axis, with the 97% standard line."""
+    g = df[df["channel"].isin(channels)].groupby("bucket")[["answered", "abandoned"]].sum()
+    g = g[(g["answered"] + g["abandoned"]) > 0]
+    if g.empty:
+        return fig
+    resp = g["answered"] / (g["answered"] + g["abandoned"])
+    fig.add_scatter(x=g.index, y=resp, name="% responded (right)", mode="lines+markers", yaxis="y2",
+                    line=dict(color="#222", width=2), marker=dict(size=5),
+                    hovertemplate="%{y:.1%}<extra>% responded</extra>")
+    lo = min(0.8, (resp.min() // 0.05) * 0.05)
+    fig.update_layout(yaxis2=dict(overlaying="y", side="right", range=[lo, 1.005], tickformat=".0%", showgrid=False, title="% responded"))
+    fig.add_shape(type="line", xref="paper", x0=0, x1=1, yref="y2", y0=0.97, y1=0.97, line=dict(dash="dash", color="gray", width=1))
+    return fig
+
+
 def base_layout(fig, h=320, ytitle=None, yfmt=None):
     fig.update_layout(height=h, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=-0.2),
                       hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
@@ -460,12 +480,7 @@ def dashboard():
             "Year to date": (dt.date(last.year, 1, 1), last),
             "All data": (data_min, data_max),
         }
-        camp_opts = camps[(camps["end"].dt.date >= data_min) & (camps["start"].dt.date <= data_max)].sort_values("start", ascending=False)
-        camp_pick = st.selectbox("Jump to a campaign period", ["(none)"] + [f"{r.campaign} · {r.start:%-d %b} to {r.end:%-d %b %Y}" for r in camp_opts.itertuples()])
-        if camp_pick != "(none)":
-            r = camp_opts.iloc[[f"{r.campaign} · {r.start:%-d %b} to {r.end:%-d %b %Y}" for r in camp_opts.itertuples()].index(camp_pick)]
-            start, end = max(r["start"].date(), data_min), min(r["end"].date(), data_max)
-        elif preset == "Custom":
+        if preset == "Custom":
             rng = st.date_input("From / To", value=(m0, last), min_value=data_min, max_value=data_max)
             start, end = (rng if isinstance(rng, tuple) and len(rng) == 2 else (m0, last))
         else:
@@ -489,12 +504,6 @@ def dashboard():
     if cur.empty:
         st.info("No data in the selected period.")
         return
-
-    # campaign chips
-    if len(in_camp):
-        st.markdown("**Campaigns in this period:** " + " · ".join(f"`{r.campaign}` {r.start:%-d %b} to {r.end:%-d %b}" for r in in_camp.itertuples()))
-    else:
-        st.markdown("**Campaigns in this period:** none planned")
 
     # ---- standards check ----
     checks = []  # (title, key, value, grade, metrics)
@@ -602,24 +611,31 @@ def dashboard():
 
     # ---- volume charts ----
     st.subheader("Contact volume")
-    st.caption(f"Charts are {gran_word}. Shaded bands are campaign periods (red Mega Sale, blue Brand Day, green Seasonal).")
+    st.caption(f"Charts are {gran_word}. Shaded bands are campaign periods inside the selected dates (red Mega Sale, blue Brand Day, green Seasonal).")
+    if len(in_camp):
+        st.markdown("**Campaign windows shaded on the charts:** " + " · ".join(f"`{r.campaign}` {r.start:%-d %b} to {r.end:%-d %b}" for r in in_camp.itertuples()))
+    else:
+        st.markdown("**Campaign windows shaded on the charts:** none planned in this period")
     cur["bucket"] = bucket(cur, gran)
-    vol = cur[cur["channel"].isin(CONTACT)].pivot_table(index="bucket", columns="channel", values="answered", aggfunc="sum").fillna(0)
+    cur["total_contacts"] = cur["answered"].fillna(0) + cur["abandoned"].fillna(0)
+    vol = cur[cur["channel"].isin(CONTACT)].pivot_table(index="bucket", columns="channel", values="total_contacts", aggfunc="sum").fillna(0)
     fig = go.Figure()
     for c in CONTACT:
         if c in vol.columns:
-            fig.add_bar(x=vol.index, y=vol[c], name=SEG_NAME[c], marker_color=COLOR[c])
-    fig.update_layout(barmode="stack", title="Contacts answered by channel")
-    ab = cur[cur["channel"].isin(CONTACT)].groupby("bucket")["abandoned"].sum()
-    fig.add_bar(x=ab.index, y=ab.values, name="Abandoned (all channels)", marker_color="#E45756")
+            fig.add_bar(x=vol.index, y=vol[c], name=SEG_NAME[c], marker_color=COLOR[c], hovertemplate="%{y:,.0f}<extra>" + SEG_NAME[c] + "</extra>")
+    fig.update_layout(barmode="stack", title="Total contacts by channel (answered + abandoned), with % responded")
+    add_resp_line(fig, cur, CONTACT)
     add_campaign_bands(fig, camps, s_ts, e_ts)
-    st.plotly_chart(base_layout(fig, 340, "contacts"), width="stretch")
+    st.plotly_chart(base_layout(fig, 360, "total contacts"), width="stretch")
 
     v1, v2 = st.columns(2)
     share = pd.Series({SEG_NAME[c]: (T["seg"][c]["total_contacts"] or 0) for c in CONTACT}).sort_values()
-    f2 = go.Figure(go.Bar(x=share.values, y=share.index, orientation="h", marker_color=[COLOR[k] for k in [c for c in CONTACT for n in [SEG_NAME[c]] if n in share.index]][: len(share)],
-                          text=[f"{v:,.0f} · {v / max(T['total_contacts'], 1):.1%}" for v in share.values], textposition="outside"))
-    f2.update_layout(title="Share of total contacts by channel")
+    name2ch = {SEG_NAME[c]: c for c in CONTACT}
+    f2 = go.Figure(go.Bar(x=share.values, y=share.index, orientation="h", marker_color=[COLOR[name2ch[n]] for n in share.index],
+                          text=[f"{v:,.0f} ({v / max(T['total_contacts'], 1):.1%}) · {fmt('int', T['seg'][name2ch[n]]['answered'])} answered ({fmt('pct', T['seg'][name2ch[n]]['answer_rate'])})" for n, v in share.items()],
+                          textposition="outside", cliponaxis=False))
+    f2.update_layout(title="Share of total contacts by channel, with answered and % responded")
+    f2.update_xaxes(range=[0, share.max() * 1.9 if len(share) else 1])
     v1.plotly_chart(base_layout(f2, 280), width="stretch")
     cs = cur[cur["channel"] == "case"].groupby("bucket")[["complete", "pending"]].sum()
     f3 = go.Figure([go.Bar(x=cs.index, y=cs["complete"], name="Complete", marker_color=COLOR["case"]), go.Bar(x=cs.index, y=cs["pending"], name="Pending", marker_color=COLOR["complaint"])])
@@ -648,24 +664,26 @@ def dashboard():
         tbl["label"] = tbl.apply(lambda r: r["campaign"] + (f" ({r['start']:%-d %b})" if (tbl["campaign"] == r["campaign"]).sum() > 1 and r["kind"] != "—" else "") + (" *" if r["clipped"] else ""), axis=1)
         c1, c2 = st.columns(2)
         f4 = go.Figure(go.Bar(x=tbl["per_day"], y=tbl["label"], orientation="h", marker_color=[{"Mega Sale": "#E45756", "Brand Day": "#4C78A8", "Seasonal": "#54A24B"}.get(k, "#999") for k in tbl["kind"]],
-                              text=[f"{v:.0f} · {d} d" for v, d in zip(tbl["per_day"], tbl["days"])], textposition="outside"))
+                              text=[f"{v:.0f} · {a:.0f} answered · {fmt('pct', r)} · {d} d" for v, a, r, d in zip(tbl["per_day"], tbl["answered_per_day"].fillna(0), tbl["answer_rate"], tbl["days"])], textposition="outside", cliponaxis=False))
         f4.update_layout(title="Total contacts per day, by campaign")
+        f4.update_xaxes(range=[0, tbl["per_day"].max() * 1.8])
         c1.plotly_chart(base_layout(f4, max(240, 32 * len(tbl))), width="stretch")
         f5 = go.Figure(go.Bar(x=tbl["answer_rate"], y=tbl["label"], orientation="h", marker_color=[{"Mega Sale": "#E45756", "Brand Day": "#4C78A8", "Seasonal": "#54A24B"}.get(k, "#999") for k in tbl["kind"]],
                               text=[f"{v:.1%} · {a:,.0f} lost" for v, a in zip(tbl["answer_rate"].fillna(0), tbl["abandoned"])], textposition="outside"))
         f5.add_vline(x=0.97, line_dash="dash", line_color="gray", annotation_text="Excellent 97%")
-        f5.update_layout(title="Response rate by campaign (answered ÷ offered)")
-        c2.plotly_chart(base_layout(f5, max(240, 32 * len(tbl)), yfmt=".0%"), width="stretch")
-        f5.update_xaxes(tickformat=".0%", range=[0, 1.05])
+        f5.update_layout(title="% responded by campaign (answered ÷ total contacts)")
+        f5.update_xaxes(tickformat=".0%", range=[0, 1.45])
+        f5.update_traces(cliponaxis=False)
+        c2.plotly_chart(base_layout(f5, max(240, 32 * len(tbl))), width="stretch")
         show = pd.DataFrame({
             "Campaign": tbl["label"], "Type": tbl["kind"],
             "Window": [("selected period" if k == "—" else f"{s:%-d %b} to {e:%-d %b %Y}") for k, s, e in zip(tbl["kind"], tbl["start"], tbl["end"])],
-            "Days": tbl["days"], "Total contacts": tbl["total_contacts"], "Answered": tbl["answered"], "Per day": tbl["per_day"].round(0),
+            "Days": tbl["days"], "Total contacts": tbl["total_contacts"], "Answered": tbl["answered"], "Contacts per day": tbl["per_day"].round(0), "Answered per day": tbl["answered_per_day"].round(0),
             "Abandon %": tbl["abandon_rate"], "Response %": tbl["answer_rate"], "Avg call wait (s)": tbl["wait"].round(0),
             "Call CSAT": tbl["csat_call"], "Cases": [c["total_cases"] for c in tbl["case"]], "Complaints": [c["total_cases"] for c in tbl["complaint"]],
             "Complaints per 1,000": [(c["total_cases"] / a * 1000) if a else None for c, a in zip(tbl["complaint"], tbl["answered"])],
         })
-        st.dataframe(show.style.format({"Abandon %": "{:.2%}", "Response %": "{:.1%}", "Call CSAT": "{:.1%}", "Total contacts": "{:,.0f}", "Answered": "{:,.0f}", "Per day": "{:,.0f}", "Complaints per 1,000": "{:.2f}"}, na_rep="—"),
+        st.dataframe(show.style.format({"Abandon %": "{:.2%}", "Response %": "{:.1%}", "Call CSAT": "{:.1%}", "Total contacts": "{:,.0f}", "Answered": "{:,.0f}", "Contacts per day": "{:,.0f}", "Answered per day": "{:,.0f}", "Complaints per 1,000": "{:.2f}"}, na_rep="—"),
                      width="stretch", hide_index=True)
         if tbl["clipped"].any():
             st.caption("* window extends beyond the selected period; figures cover the days inside it.")
@@ -710,6 +728,14 @@ def dashboard():
         k[0].metric("Total contacts", fmt("int", T["total_contacts"])); k[1].metric("Answered", fmt("int", T["answered"]))
         k[2].metric(f"% responded · {BADGE[grade('abandon_all', T['abandon_rate'])]}", fmt("pct", T["answer_rate"]))
         k[3].metric("Abandoned", fmt("int", T["abandoned"])); k[4].metric("Prior period total contacts", fmt("int", P["total_contacts"]))
+        figt = go.Figure()
+        for c in CONTACT:
+            if c in vol.columns:
+                figt.add_bar(x=vol.index, y=vol[c], name=SEG_NAME[c], marker_color=COLOR[c])
+        figt.update_layout(barmode="stack", title=f"Total contacts per {gran_word[:-2] if gran_word != 'daily' else 'day'} across call, chat and email, with % responded")
+        add_resp_line(figt, cur, CONTACT)
+        add_campaign_bands(figt, camps, s_ts, e_ts)
+        st.plotly_chart(base_layout(figt, 300, "total contacts"), width="stretch")
         st.dataframe(d.style.format({"Abandon %": "{:.2%}", "% responded": "{:.1%}"}, precision=0, na_rep="—"), width="stretch")
     else:
         r = cur[cur["channel"] == seg].set_index("date").sort_index()
@@ -735,8 +761,9 @@ def dashboard():
             else:
                 c[4].metric("Out of service hours" if seg != "email" else "Avg HC", fmt("int", m["out_of_service"] if seg != "email" else (m["hc_days"] / max(1, m["days"]) if m["hc_days"] else None)))
             c[5].metric(f"CSAT · {BADGE[grade('csat', m['csat'])]}" if seg != "email" else "Per agent-day", fmt("pct", m["csat"]) if seg != "email" else fmt("int", m["per_agent_day"]))
-            fig = go.Figure([go.Bar(x=r.index, y=r["answered"], name="Answered", marker_color=COLOR[seg]), go.Bar(x=r.index, y=r["abandoned"], name="Abandoned", marker_color="#E45756")])
-            fig.update_layout(barmode="stack")
+            fig = go.Figure([go.Bar(x=r.index, y=r["answered"], name="Answered", marker_color=COLOR[seg]), go.Bar(x=r.index, y=r["abandoned"], name="Abandoned" if seg != "email" else "Unanswered", marker_color="#E45756")])
+            fig.update_layout(barmode="stack", title=f"Total {SEG_NAME[seg]} contacts per day (answered + abandoned), with % responded")
+            add_resp_line(fig, cur.assign(bucket=cur["date"]), [seg])
             cols = [x for x in ["answered", "abandoned", "short_abandoned", "avg_wait_sec", "out_of_service", "csat", "hc"] if x in r.columns and r[x].notna().any()]
             r["total"] = r["answered"].fillna(0) + r["abandoned"].fillna(0)
             r["% responded"] = r["answered"] / r["total"]
